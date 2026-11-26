@@ -1,0 +1,11 @@
+services:
+  release-page:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - oci-data:/data
+    restart: unless-stopped
+
+volumes:
+  oci-data:

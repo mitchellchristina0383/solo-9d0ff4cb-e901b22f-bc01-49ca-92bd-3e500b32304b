@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>多架构镜像发布</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; --line:#d0d7de; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; color: #1f2328; background: var(--bg); }
+  header { background: #0d1117; color: #fff; padding: 12px 20px; display: flex;
+           align-items: baseline; gap: 12px; }
+  header h1 { font-size: 17px; margin: 0; }
+  header span { color: #9da7b3; font-size: 13px; }
+  main { max-width: 1180px; margin: 18px auto; padding: 0 16px; display: grid; gap: 16px; }
+  section { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left;
+           vertical-align: top; }
+  th { color: #57606a; font-weight: 600; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  button { font-size: 13px; padding: 5px 12px; border: 1px solid var(--line);
+           border-radius: 6px; background: #fff; cursor: pointer; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  select { font-size: 13px; padding: 4px; max-width: 100%; }
+  .banner { display: none; padding: 10px 14px; border-radius: 8px; font-size: 14px; }
+  .banner.show { display: block; }
+  .banner.error { background: #ffebe9; border: 1px solid #ff818266; color: var(--bad); }
+  .banner.ok { background: #dafbe1; border: 1px solid #4ac26b66; color: var(--ok); }
+  .banner.warn { background: #fff8c5; border: 1px solid #d4a72c66; color: var(--warn); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .pill.verifying, .pill.committing { background: #fff8c5; color: var(--warn); }
+  .pill.done { background: #dafbe1; color: var(--ok); }
+  .pill.failed, .pill.conflict { background: #ffebe9; color: var(--bad); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .row > label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; flex: 1; min-width: 220px; }
+  #tag-detail { font-size: 13px; }
+  #tag-detail pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+                    padding: 10px; overflow: auto; max-height: 320px; }
+  .muted { color: #57606a; }
+  .progressbar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; min-width: 120px; }
+  .progressbar > div { height: 100%; background: #1f6feb; }
+</style>
+</head>
+<body>
+<header>
+  <h1>多架构镜像发布</h1>
+  <span>本地 OCI Image Layout · amd64 + arm64 同提交核对</span>
+</header>
+<main>
+  <div id="banner" class="banner"></div>
+
+  <section>
+    <h2>标签现状 <button id="refresh" style="float:right">刷新</button></h2>
+    <table id="tags-table">
+      <thead><tr><th>标签</th><th>类型</th><th>摘要</th><th>架构</th><th>revision</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="tag-detail" style="margin-top:10px"></div>
+  </section>
+
+  <section>
+    <h2>发起发布</h2>
+    <div class="row">
+      <label>目标标签
+        <select id="rel-tag"></select>
+      </label>
+      <label>amd64 清单
+        <select id="rel-amd64"></select>
+      </label>
+      <label>arm64 清单
+        <select id="rel-arm64"></select>
+      </label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span class="muted" style="font-size:13px">提交时将核对标签摘要仍为
+        <code id="rel-expected">—</code>（选清单时所见），否则提示刷新。</span>
+      <button class="primary" id="rel-submit">校验并发布</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>发布记录</h2>
+    <table id="jobs-table">
+      <thead><tr><th>ID</th><th>标签</th><th>状态</th><th>进度</th><th>信息</th><th>结果</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const short = (d) => d ? d.slice(0, 19) + "…" : "—";
+const shortRev = (r) => r ? r.slice(0, 12) : "—";
+let tagsCache = [];
+let notifiedJobs = new Set();
+
+function banner(kind, html) {
+  const el = $("banner");
+  if (!kind) { el.className = "banner"; el.innerHTML = ""; return; }
+  el.className = "banner show " + kind;
+  el.innerHTML = html;
+}
+
+async function api(path, opts) {
+  const resp = await fetch(path, opts);
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw Object.assign(new Error(body.error || resp.statusText), {status: resp.status, body});
+  return body;
+}
+
+function candLabel(c) {
+  const rev = c.revision ? c.revision.slice(0, 12) : "无revision";
+  const tags = c.tags.length ? " [" + c.tags.join(", ") + "]" : "";
+  const err = c.error ? " ⚠" : "";
+  return `${c.architecture || "?"} · ${rev} · ${c.digest.slice(7, 19)}${tags}${err}`;
+}
+
+async function loadOverview() {
+  const data = await api("/api/overview");
+  tagsCache = data.tags;
+  // 标签表
+  const tbody = document.querySelector("#tags-table tbody");
+  tbody.innerHTML = "";
+  for (const t of data.tags) {
+    const tr = document.createElement("tr");
+    const kind = t.kind === "index" ? "多架构索引" : t.kind === "manifest" ? "单架构清单" : (t.kind || "—");
+    tr.innerHTML = `<td class="mono"></td><td>${kind}</td><td class="mono" title="${t.digest || ""}">${short(t.digest)}</td>
+      <td>${(t.arches || []).join(", ") || "—"}</td>
+      <td class="mono">${(t.revisions || []).map(shortRev).join(", ") || "—"}</td>
+      <td></td>`;
+    tr.children[0].textContent = t.tag;
+    const btn = document.createElement("button");
+    btn.textContent = "查看索引/清单";
+    btn.onclick = () => showTag(t.tag);
+    tr.children[5].appendChild(btn);
+    tbody.appendChild(tr);
+  }
+  // 发布表单
+  const tagSel = $("rel-tag");
+  const prevTag = tagSel.value;
+  tagSel.innerHTML = "";
+  for (const t of data.tags) {
+    const opt = document.createElement("option");
+    opt.value = t.tag; opt.textContent = `${t.tag}（当前 ${short(t.digest)}）`;
+    tagSel.appendChild(opt);
+  }
+  if ([...tagSel.options].some(o => o.value === prevTag)) tagSel.value = prevTag;
+  updateExpected();
+  const fill = (sel, arch) => {
+    const el = $(sel);
+    const prev = el.value;
+    el.innerHTML = "";
+    for (const c of data.candidates.filter(c => c.architecture === arch)) {
+      const opt = document.createElement("option");
+      opt.value = c.digest; opt.textContent = candLabel(c);
+      el.appendChild(opt);
+    }
+    if ([...el.options].some(o => o.value === prev)) el.value = prev;
+  };
+  fill("rel-amd64", "amd64");
+  fill("rel-arm64", "arm64");
+}
+
+function updateExpected() {
+  const t = tagsCache.find(t => t.tag === $("rel-tag").value);
+  $("rel-expected").textContent = t ? short(t.digest) : "(标签不存在)";
+  $("rel-expected").title = t ? t.digest : "";
+}
+
+async function showTag(name) {
+  const box = $("tag-detail");
+  box.innerHTML = "加载中…";
+  try {
+    const d = await api("/api/tags/" + encodeURIComponent(name));
+    let html = `<b>${d.tag}</b> · 当前摘要 <code>${d.descriptor.digest}</code>`;
+    if (d.manifests) {
+      html += `<table style="margin-top:8px"><thead><tr><th>架构</th><th>清单摘要</th><th>revision</th></tr></thead><tbody>`;
+      for (const m of d.manifests) {
+        html += `<tr><td>${(m.platform && m.platform.architecture) || m.architecture || "?"}</td>
+          <td class="mono">${m.digest}</td><td class="mono">${m.revision || "—"}</td></tr>`;
+      }
+      html += "</tbody></table>";
+    } else if (d.manifest) {
+      html += `<div style="margin-top:8px">单架构清单 <code>${d.manifest.digest}</code>
+        · 架构 ${d.manifest.architecture} · revision <code>${d.manifest.revision || "—"}</code></div>`;
+    }
+    if (d.index) html += `<details style="margin-top:8px"><summary>索引 JSON</summary><pre>${JSON.stringify(d.index, null, 2)}</pre></details>`;
+    box.innerHTML = html;
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--bad)">${e.message}</span>`;
+  }
+}
+
+async function submitRelease() {
+  const tag = $("rel-tag").value;
+  const t = tagsCache.find(t => t.tag === tag);
+  const payload = {
+    tag,
+    amd64: $("rel-amd64").value,
+    arm64: $("rel-arm64").value,
+    expected_tag_digest: t ? t.digest : "",
+  };
+  if (!payload.amd64 || !payload.arm64) { banner("error", "请选择两份清单"); return; }
+  $("rel-submit").disabled = true;
+  try {
+    await api("/api/releases", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    banner(null);
+    pollJobs();
+  } catch (e) {
+    banner("error", "提交失败：" + e.message);
+  } finally {
+    $("rel-submit").disabled = false;
+  }
+}
+
+const STATUS_TEXT = {verifying: "校验中", committing: "提交中", done: "完成", failed: "失败", conflict: "冲突·需刷新"};
+
+async function pollJobs() {
+  const data = await api("/api/releases");
+  const tbody = document.querySelector("#jobs-table tbody");
+  tbody.innerHTML = "";
+  let needRefresh = false;
+  for (const j of data.jobs) {
+    const p = j.progress || {};
+    const pct = p.files_total ? Math.round(100 * (p.files_done || 0) / p.files_total) : 0;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="mono">${j.id}</td><td class="mono"></td>
+      <td><span class="pill ${j.status}">${STATUS_TEXT[j.status] || j.status}</span></td>
+      <td><div class="progressbar"><div style="width:${pct}%"></div></div>
+          <span class="muted">${p.files_done || 0}/${p.files_total || 0} 文件</span></td>
+      <td></td><td class="mono"></td>`;
+    tr.children[1].textContent = j.tag;
+    tr.children[4].textContent = j.message || "";
+    tr.children[5].textContent = j.result ? short(j.result.index_digest) : "";
+    tr.children[5].title = j.result ? j.result.index_digest : "";
+    tbody.appendChild(tr);
+    if (["done", "failed", "conflict"].includes(j.status) && !notifiedJobs.has(j.id)) {
+      notifiedJobs.add(j.id);
+      needRefresh = true;
+      if (j.status === "done") banner("ok", `✅ ${j.message}（revision ${j.result.revision.slice(0, 12)}）`);
+      else if (j.status === "conflict") banner("warn", `⚠️ ${j.message}`);
+      else banner("error", `❌ ${j.message}`);
+    }
+  }
+  if (needRefresh) loadOverview();
+}
+
+$("refresh").onclick = () => { banner(null); loadOverview(); };
+$("rel-tag").onchange = updateExpected;
+$("rel-submit").onclick = submitRelease;
+
+loadOverview().catch(e => banner("error", e.message));
+setInterval(pollJobs, 1000);
+</script>
+</body>
+</html>
